@@ -5,25 +5,31 @@ const fetch = require("node-fetch"); // we installed node-fetch@2
 const app = express();
 app.use(express.json());
 
-// ---- CONFIG: fill these with your actual values ----
+// ---- CONFIG: use environment variables ----
+// On Render, set these as environment variables:
+//   SHOPIFY_DOMAIN      = edd11f-2.myshopify.com
+//   SHOPIFY_ADMIN_TOKEN = your Admin API access token (shpat_...)
 const SHOPIFY_DOMAIN = process.env.SHOPIFY_DOMAIN || "edd11f-2.myshopify.com";
-const ADMIN_TOKEN    = process.env.SHOPIFY_ADMIN_TOKEN || "";
+const ADMIN_TOKEN    = process.env.SHOPIFY_ADMIN_TOKEN;
 const API_VERSION    = "2024-07";
 // ----------------------------------------------------
 
 async function shopifyAdminGraphQL(query, variables = {}) {
   if (!ADMIN_TOKEN) {
-    throw new Error("Missing SHOPIFY_ADMIN_TOKEN env var");
+    throw new Error("Missing SHOPIFY_ADMIN_TOKEN (Admin API token)");
   }
 
-  const res = await fetch(`https://${SHOPIFY_DOMAIN}/admin/api/${API_VERSION}/graphql.json`, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      "X-Shopify-Access-Token": ADMIN_TOKEN
-    },
-    body: JSON.stringify({ query, variables })
-  });
+  const res = await fetch(
+    `https://${SHOPIFY_DOMAIN}/admin/api/${API_VERSION}/graphql.json`,
+    {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "X-Shopify-Access-Token": ADMIN_TOKEN
+      },
+      body: JSON.stringify({ query, variables })
+    }
+  );
 
   const json = await res.json();
   if (!res.ok) {
@@ -81,6 +87,7 @@ app.post("/api/create-order", async (req, res) => {
       return res.status(400).json({ error: "Missing productId or quantity" });
     }
 
+    // 2.1 Get the first variant ID for the product
     const variantQuery = `
       query getVariant($id: ID!) {
         product(id: $id) {
@@ -104,9 +111,11 @@ app.post("/api/create-order", async (req, res) => {
 
     const variantId = product.variants.edges[0].node.id;
 
+    // 2.2 Create the order
+    // New Admin API syntax: orderCreate(order: OrderInput!)
     const orderMutation = `
-      mutation createOrder($input: OrderInput!) {
-        orderCreate(input: $input) {
+      mutation createOrder($order: OrderInput!) {
+        orderCreate(order: $order) {
           order {
             id
             name
@@ -136,12 +145,14 @@ app.post("/api/create-order", async (req, res) => {
       financialStatus: "PAID"
     };
 
-    const orderData = await shopifyAdminGraphQL(orderMutation, { input: orderInput });
+    const orderData = await shopifyAdminGraphQL(orderMutation, { order: orderInput });
     const result = orderData.orderCreate;
 
     if (result.userErrors && result.userErrors.length) {
       console.error("orderCreate userErrors", result.userErrors);
-      return res.status(400).json({ error: "Shopify order error", details: result.userErrors });
+      return res
+        .status(400)
+        .json({ error: "Shopify order error", details: result.userErrors });
     }
 
     res.json({
