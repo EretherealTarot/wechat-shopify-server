@@ -1,6 +1,6 @@
 // server.js (tiny Shopify bridge for WeChat)
 const express = require("express");
-const fetch = require("node-fetch"); // we installed node-fetch@2
+const fetch = require("node-fetch"); // node-fetch@2
 
 const app = express();
 app.use(express.json());
@@ -112,9 +112,10 @@ app.post("/api/create-order", async (req, res) => {
     const variantId = product.variants.edges[0].node.id;
 
     // 2.2 Create the order
-    // New Admin API syntax: orderCreate(order: OrderInput!)
+    // IMPORTANT: orderCreate now expects OrderCreateOrderInput
+    // https://shopify.dev/docs/api/admin-graphql/latest/mutations/orderCreate  [oai_citation:0‡Shopify](https://shopify.dev/docs/api/admin-graphql/latest/mutations/orderCreate?utm_source=chatgpt.com)
     const orderMutation = `
-      mutation createOrder($order: OrderInput!) {
+      mutation createOrder($order: OrderCreateOrderInput!) {
         orderCreate(order: $order) {
           order {
             id
@@ -142,7 +143,7 @@ app.post("/api/create-order", async (req, res) => {
       ],
       tags: ["WeChat Mini Program"],
       note: note || "Order from WeChat Mini Program",
-      financialStatus: "PAID"
+      financialStatus: "PAID" // mark as paid; we'll wire real payment later
     };
 
     const orderData = await shopifyAdminGraphQL(orderMutation, { order: orderInput });
