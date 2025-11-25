@@ -5,20 +5,23 @@ const fetch = require("node-fetch");
 const app = express();
 app.use(express.json());
 
-// ---------------------------------------------------------
-// CONFIG (safe: tokens loaded from Render dashboard only)
-// ---------------------------------------------------------
+// -----------------------------------------
+// CONFIG (tokens from environment only)
+// -----------------------------------------
 const SHOPIFY_DOMAIN = process.env.SHOPIFY_DOMAIN || "edd11f-2.myshopify.com";
 const ADMIN_TOKEN = process.env.SHOPIFY_ADMIN_TOKEN;
 const API_VERSION = "2024-07";
 
+if (!SHOPIFY_DOMAIN) {
+  console.error("❌ Missing SHOPIFY_DOMAIN env var");
+}
 if (!ADMIN_TOKEN) {
-  console.error("❌ Missing SHOPIFY_ADMIN_TOKEN environment variable!");
+  console.error("❌ Missing SHOPIFY_ADMIN_TOKEN env var");
 }
 
-// ---------------------------------------------------------
-// Helper to call Shopify Admin GraphQL
-// ---------------------------------------------------------
+// -----------------------------------------
+// Helper: call Shopify Admin GraphQL
+// -----------------------------------------
 async function shopifyAdminGraphQL(query, variables = {}) {
   const res = await fetch(
     `https://${SHOPIFY_DOMAIN}/admin/api/${API_VERSION}/graphql.json`,
@@ -40,23 +43,25 @@ async function shopifyAdminGraphQL(query, variables = {}) {
   }
 
   if (json.errors) {
-    console.error("Shopify GraphQL errors", json.errors);
-    throw new Error(json.errors[0]?.message || "GraphQL error");
+    console.error("Shopify GraphQL errors:", json.errors);
+    throw new Error(json.errors[0]?.message || "Shopify GraphQL error");
   }
 
   return json.data;
 }
 
-// ---------------------------------------------------------
+// -----------------------------------------
 // 1) REAL INVENTORY LOOKUP
-// ---------------------------------------------------------
+// -----------------------------------------
 app.get("/api/stock", async (req, res) => {
   try {
     const productId = req.query.productId;
-    if (!productId) return res.status(400).json({ error: "Missing productId" });
+    if (!productId) {
+      return res.status(400).json({ error: "Missing productId" });
+    }
 
     const query = `
-      query ($id: ID!) {
+      query getStock($id: ID!) {
         product(id: $id) {
           id
           totalInventory
@@ -73,46 +78,60 @@ app.get("/api/stock", async (req, res) => {
       available: qty > 0
     });
   } catch (err) {
-    console.error("GET /api/stock error", err);
+    console.error("GET /api/stock error:", err);
     res.status(500).json({ error: "Internal error" });
   }
 });
 
-// ---------------------------------------------------------
-// 2) CREATE SHOPIFY ORDER (correct API for Admin)
-// ---------------------------------------------------------
+// -----------------------------------------
+// 2) CREATE SHOPIFY ORDER (simple, stable)
+// -----------------------------------------
 app.post("/api/create-order", async (req, res) => {
   try {
-    const { productId, quantity } = req.body;
+    const { productId, quantity, email, note } = req.body || {};
 
-    if (!productId || !quantity)
+    if (!productId || !quantity) {
       return res.status(400).json({ error: "Missing productId or quantity" });
+    }
 
-    // Fetch variant
+    // 1) Get a variant for this product
     const variantQuery = `
-      query ($id: ID!) {
+      query getVariant($id: ID!) {
         product(id: $id) {
+          id
           title
           variants(first: 1) {
             edges {
-              node { id }
+              node {
+                id
+              }
             }
           }
         }
       }
     `;
 
-    const productData = await shopifyAdminGraphQL(variantQuery, { id: productId });
-    const variantId = productData.product.variants.edges[0].node.id;
+    const varData = await shopifyAdminGraphQL(variantQuery, { id: productId });
+    const product = varData?.product;
+    const edges = product?.variants?.edges || [];
 
-    // Create the order (correct OrderCreate mutation)
+    if (!product || !edges.length) {
+      return res.status(404).json({ error: "Product or variant not found" });
+    }
+
+    const variantId = edges[0].node.id;
+
+    // 2) Create the order with Shopify's default pricing for that variant
     const orderMutation = `
-      mutation orderCreate($input: OrderCreateInput!) {
+      mutation createOrder($input: OrderInput!) {
         orderCreate(input: $input) {
           order {
             id
             name
             email
+            totalPriceSet {
+              shopMoney { amount currencyCode }
+            }
           }
           userErrors {
             field
@@ -123,39 +142,47 @@ app.post("/api/create-order", async (req, res) => {
     `;
 
     const orderInput = {
-      email: "wechat-order@example.com",
+      email: email || "wechat-order@example.com",
       lineItems: [
         {
           quantity,
           variantId
         }
       ],
-      tags: ["WeChat MiniProgram"],
+      tags: ["WeChat Mini Program"],
+      note: note || "Order from WeChat Mini Program",
+      // We consider the order already paid (AlphaPay will handle real payment later)
       financialStatus: "PAID"
     };
 
-    const result = await shopifyAdminGraphQL(orderMutation, { input: orderInput });
+    const data = await shopifyAdminGraphQL(orderMutation, { input: orderInput });
+    const result = data?.orderCreate;
 
-    if (result.orderCreate.userErrors.length > 0) {
+    if (!result) {
+      console.error("orderCreate missing in response:", data);
+      return res.status(500).json({ error: "orderCreate missing in response" });
+    }
+
+    if (result.userErrors && result.userErrors.length) {
+      console.error("orderCreate userErrors:", result.userErrors);
       return res.status(400).json({
         error: "Shopify order error",
-        details: result.orderCreate.userErrors
+        details: result.userErrors
       });
     }
 
     res.json({
       success: true,
-      order: result.orderCreate.order
+      order: result.order
     });
-
   } catch (err) {
     console.error("POST /api/create-order error:", err);
     res.status(500).json({ error: "Internal error" });
   }
 });
 
-// ---------------------------------------------------------
+// -----------------------------------------
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
-  console.log("✔ Tiny Shopify server running on port", PORT);
+  console.log("Wechat-Shopify server running on port", PORT);
 });
