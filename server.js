@@ -5,9 +5,9 @@ const fetch = require("node-fetch"); // node-fetch@2
 const app = express();
 app.use(express.json());
 
-// ---- CONFIG: fill these with your actual values ----
+// ---- CONFIG: real values via env ----
 const SHOPIFY_DOMAIN = process.env.SHOPIFY_DOMAIN || "edd11f-2.myshopify.com";
-const ADMIN_TOKEN    = process.env.SHOPIFY_ADMIN_TOKEN || ""; // <== leave empty in code; set in Render env
+const ADMIN_TOKEN    = process.env.SHOPIFY_ADMIN_TOKEN || ""; // <-- set in Render, not here
 const API_VERSION    = "2024-07";
 
 // WeChat price: 318 CNY per unit
@@ -108,9 +108,10 @@ app.post("/api/create-order", async (req, res) => {
 
     const variantId = product.variants.edges[0].node.id;
 
-    // 2) Create the order with an explicit 318 CNY unit price
+    // 2) Create the order using the new schema: OrderCreateOrderInput
+    //    This wrapper contains an "order" field of type OrderInput.
     const orderMutation = `
-      mutation createOrder($order: OrderInput!) {
+      mutation createOrder($order: OrderCreateOrderInput!) {
         orderCreate(order: $order) {
           order {
             id
@@ -133,34 +134,33 @@ app.post("/api/create-order", async (req, res) => {
       }
     `;
 
-    const orderInput = {
+    // Inner OrderInput (actual order data)
+    const innerOrderInput = {
       email: email || "no-email@example.com",
       lineItems: [
         {
           quantity: quantity,
           variantId: variantId,
 
-          // 🔥 Force unit price to 318 CNY in Shopify’s money bag (presentment & shop)
-          // If Shopify enforces shopMoney as store currency, it will complain in logs
-          // and we can adjust; for now we send both as CNY so the order clearly shows ¥318.
-          originalUnitPriceSet: {
-            presentmentMoney: {
-              amount: CN_UNIT_PRICE_CNY,
-              currencyCode: "CNY"
-            },
-            shopMoney: {
-              amount: CN_UNIT_PRICE_CNY,
-              currencyCode: "CNY"
-            }
+          // 🔥 Force the unit price to 318 CNY.
+          // Shopify derives price sets from this; we don't touch the *_PriceSet fields directly.
+          originalUnitPrice: {
+            amount: CN_UNIT_PRICE_CNY,
+            currencyCode: "CNY"
           }
         }
       ],
       tags: ["WeChat Mini Program"],
       note: note || "Order from WeChat Mini Program (WeChat Pay ¥318)",
-      financialStatus: "PAID" // you’ll later align this with AlphaPay’s confirmation
+      financialStatus: "PAID"
     };
 
-    const orderData = await shopifyAdminGraphQL(orderMutation, { order: orderInput });
+    // Wrapper for the mutation variable: OrderCreateOrderInput
+    const outerOrderInput = {
+      order: innerOrderInput
+    };
+
+    const orderData = await shopifyAdminGraphQL(orderMutation, { order: outerOrderInput });
     const result = orderData.orderCreate;
 
     if (result.userErrors && result.userErrors.length) {
