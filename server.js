@@ -84,7 +84,7 @@ app.get("/api/stock", async (req, res) => {
 });
 
 // -----------------------------------------
-// 2) CREATE SHOPIFY ORDER (simple, stable)
+// 2) CREATE SHOPIFY ORDER (stable version)
 // -----------------------------------------
 app.post("/api/create-order", async (req, res) => {
   try {
@@ -123,8 +123,8 @@ app.post("/api/create-order", async (req, res) => {
 
     // 2) Create the order with Shopify's default pricing for that variant
     const orderMutation = `
-      mutation createOrder($input: OrderInput!) {
-        orderCreate(input: $input) {
+      mutation orderCreate($order: OrderInput!) {
+        orderCreate(order: $order) {
           order {
             id
             name
@@ -155,7 +155,8 @@ app.post("/api/create-order", async (req, res) => {
       financialStatus: "PAID"
     };
 
-    const data = await shopifyAdminGraphQL(orderMutation, { input: orderInput });
+    // 👇 IMPORTANT: pass variable AS `order`, not `input`
+    const data = await shopifyAdminGraphQL(orderMutation, { order: orderInput });
     const result = data?.orderCreate;
 
     if (!result) {
