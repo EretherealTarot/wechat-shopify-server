@@ -7,7 +7,7 @@ app.use(express.json());
 
 // ---- CONFIG: real values via env ----
 const SHOPIFY_DOMAIN = process.env.SHOPIFY_DOMAIN || "edd11f-2.myshopify.com";
-const ADMIN_TOKEN    = process.env.SHOPIFY_ADMIN_TOKEN || ""; // <-- set in Render, not here
+const ADMIN_TOKEN    = process.env.SHOPIFY_ADMIN_TOKEN || ""; // set in Render, NOT hard-coded
 const API_VERSION    = "2024-07";
 
 // WeChat price: 318 CNY per unit
@@ -84,7 +84,7 @@ app.post("/api/create-order", async (req, res) => {
       return res.status(400).json({ error: "Missing productId or quantity" });
     }
 
-    // 1) Get a variant ID for that product
+    // 1) Get variant ID for that product
     const variantQuery = `
       query getVariant($id: ID!) {
         product(id: $id) {
@@ -100,6 +100,7 @@ app.post("/api/create-order", async (req, res) => {
         }
       }
     `;
+
     const varData = await shopifyAdminGraphQL(variantQuery, { id: productId });
     const product = varData.product;
     if (!product || !product.variants.edges.length) {
@@ -108,8 +109,9 @@ app.post("/api/create-order", async (req, res) => {
 
     const variantId = product.variants.edges[0].node.id;
 
-    // 2) Create the order using the new schema: OrderCreateOrderInput
-    //    This wrapper contains an "order" field of type OrderInput.
+    // 2) Create the order
+    //    NOTE: orderCreate now expects OrderCreateOrderInput on the 'order' argument.
+    //    That type itself is the "full order" (no nested 'order' field inside).
     const orderMutation = `
       mutation createOrder($order: OrderCreateOrderInput!) {
         orderCreate(order: $order) {
@@ -134,16 +136,16 @@ app.post("/api/create-order", async (req, res) => {
       }
     `;
 
-    // Inner OrderInput (actual order data)
-    const innerOrderInput = {
+    // This object must satisfy OrderCreateOrderInput directly.
+    const orderInput = {
       email: email || "no-email@example.com",
       lineItems: [
         {
           quantity: quantity,
           variantId: variantId,
 
-          // 🔥 Force the unit price to 318 CNY.
-          // Shopify derives price sets from this; we don't touch the *_PriceSet fields directly.
+          // 🔥 Force unit price as 318 CNY.
+          // Shopify derives its price sets from this field.
           originalUnitPrice: {
             amount: CN_UNIT_PRICE_CNY,
             currencyCode: "CNY"
@@ -155,12 +157,8 @@ app.post("/api/create-order", async (req, res) => {
       financialStatus: "PAID"
     };
 
-    // Wrapper for the mutation variable: OrderCreateOrderInput
-    const outerOrderInput = {
-      order: innerOrderInput
-    };
-
-    const orderData = await shopifyAdminGraphQL(orderMutation, { order: outerOrderInput });
+    // IMPORTANT: variable $order is the OrderCreateOrderInput itself
+    const orderData = await shopifyAdminGraphQL(orderMutation, { order: orderInput });
     const result = orderData.orderCreate;
 
     if (result.userErrors && result.userErrors.length) {
