@@ -123,7 +123,7 @@ app.post("/api/create-order", async (req, res) => {
 
     // 2) Create the order with Shopify's default pricing for that variant
     const orderMutation = `
-      mutation orderCreate($order: OrderInput!) {
+      mutation orderCreate($order: OrderCreateOrderInput!) {
         orderCreate(order: $order) {
           order {
             id
@@ -155,7 +155,7 @@ app.post("/api/create-order", async (req, res) => {
       financialStatus: "PAID"
     };
 
-    // 👇 IMPORTANT: pass variable AS `order`, not `input`
+    // 👇 IMPORTANT: variable name matches mutation: $order: OrderCreateOrderInput!
     const data = await shopifyAdminGraphQL(orderMutation, { order: orderInput });
     const result = data?.orderCreate;
 
