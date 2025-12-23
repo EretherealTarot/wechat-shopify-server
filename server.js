@@ -1,44 +1,85 @@
-// server.js (tiny Shopify bridge for WeChat)
+// server.js (tiny Shopify bridge for WeChat) — FIXED
 const express = require("express");
 const fetch = require("node-fetch"); // node-fetch@2
+const cors = require("cors");
 
 const app = express();
-app.use(express.json());
+app.use(express.json({ limit: "2mb" }));
+
+// Allow requests from WeChat DevTools / devices
+app.use(
+  cors({
+    origin: "*",
+    methods: ["GET", "POST", "OPTIONS"],
+    allowedHeaders: ["Content-Type", "Authorization"],
+  })
+);
 
 // ---- CONFIG: real values via env ----
+// NOTE: Keep your existing env var names so Render doesn't need changes.
 const SHOPIFY_DOMAIN = process.env.SHOPIFY_DOMAIN || "edd11f-2.myshopify.com";
-const ADMIN_TOKEN    = process.env.SHOPIFY_ADMIN_TOKEN || ""; // set in Render, NOT hard-coded
-const API_VERSION    = "2024-07";
-
-// WeChat price: 318 CNY per unit
-const CN_UNIT_PRICE_CNY = "318.00";
+const ADMIN_TOKEN = process.env.SHOPIFY_ADMIN_TOKEN || ""; // set in Render
+const API_VERSION = process.env.SHOPIFY_API_VERSION || "2024-07";
 // ----------------------------------------------------
 
 async function shopifyAdminGraphQL(query, variables = {}) {
   if (!ADMIN_TOKEN) {
-    throw new Error("Missing ADMIN_TOKEN (set SHOPIFY_ADMIN_TOKEN env var on Render)");
+    const err = new Error(
+      "Missing ADMIN_TOKEN (set SHOPIFY_ADMIN_TOKEN env var on Render)"
+    );
+    err.code = "MISSING_ADMIN_TOKEN";
+    throw err;
   }
 
-  const res = await fetch(`https://${SHOPIFY_DOMAIN}/admin/api/${API_VERSION}/graphql.json`, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      "X-Shopify-Access-Token": ADMIN_TOKEN
-    },
-    body: JSON.stringify({ query, variables })
-  });
+  const res = await fetch(
+    `https://${SHOPIFY_DOMAIN}/admin/api/${API_VERSION}/graphql.json`,
+    {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "X-Shopify-Access-Token": ADMIN_TOKEN,
+      },
+      body: JSON.stringify({ query, variables }),
+    }
+  );
 
-  const json = await res.json();
+  const text = await res.text();
+  let json;
+  try {
+    json = JSON.parse(text);
+  } catch (e) {
+    const err = new Error(
+      `Shopify returned non-JSON. HTTP ${res.status}. Body: ${text}`
+    );
+    err.httpStatus = res.status;
+    throw err;
+  }
+
+  // HTTP-level errors
   if (!res.ok) {
     console.error("Shopify HTTP error", res.status, json);
-    throw new Error(`Shopify HTTP ${res.status}`);
+    const err = new Error(`Shopify HTTP ${res.status}`);
+    err.httpStatus = res.status;
+    err.shopify = json;
+    throw err;
   }
-  if (json.errors) {
+
+  // GraphQL top-level errors
+  if (json.errors && json.errors.length) {
     console.error("Shopify GraphQL errors", json.errors);
-    throw new Error(json.errors[0]?.message || "Shopify GraphQL error");
+    const err = new Error(json.errors.map((e) => e.message).join(" | "));
+    err.httpStatus = 500;
+    err.shopifyErrors = json.errors;
+    throw err;
   }
+
   return json.data;
 }
+
+// Health check
+app.get("/", (_req, res) => {
+  res.status(200).json({ ok: true, service: "wechat-shopify-server" });
+});
 
 // ========== 1) REAL INVENTORY LOOKUP ==========
 app.get("/api/stock", async (req, res) => {
@@ -64,24 +105,34 @@ app.get("/api/stock", async (req, res) => {
     }
 
     const qty = product.totalInventory ?? 0;
-    res.json({
+    return res.json({
       productId,
       quantity: qty,
-      available: qty > 0
+      available: qty > 0,
     });
   } catch (err) {
     console.error("GET /api/stock error", err);
-    res.status(500).json({ error: "Internal error" });
+    return res.status(500).json({
+      error: "Internal error",
+      message: err?.message || String(err),
+      shopifyErrors: err?.shopifyErrors,
+      shopify: err?.shopify,
+    });
   }
 });
 
-// ========== 2) CREATE ORDER & DECREMENT INVENTORY ==========
+// ========== 2) CREATE ORDER (NO CUSTOM PRICE OVERRIDE) ==========
 app.post("/api/create-order", async (req, res) => {
   try {
     const { productId, quantity, email, note } = req.body || {};
 
     if (!productId || !quantity) {
       return res.status(400).json({ error: "Missing productId or quantity" });
+    }
+
+    const qty = Number(quantity);
+    if (!Number.isFinite(qty) || qty <= 0) {
+      return res.status(400).json({ error: "Invalid quantity" });
     }
 
     // 1) Get variant ID for that product
@@ -92,9 +143,7 @@ app.post("/api/create-order", async (req, res) => {
           title
           variants(first: 1) {
             edges {
-              node {
-                id
-              }
+              node { id }
             }
           }
         }
@@ -103,15 +152,18 @@ app.post("/api/create-order", async (req, res) => {
 
     const varData = await shopifyAdminGraphQL(variantQuery, { id: productId });
     const product = varData.product;
-    if (!product || !product.variants.edges.length) {
+
+    if (!product || !product.variants?.edges?.length) {
       return res.status(404).json({ error: "Product or variant not found" });
     }
 
     const variantId = product.variants.edges[0].node.id;
 
     // 2) Create the order
-    //    NOTE: orderCreate now expects OrderCreateOrderInput on the 'order' argument.
-    //    That type itself is the "full order" (no nested 'order' field inside).
+    // IMPORTANT:
+    // - DO NOT include originalUnitPrice (not supported in OrderCreateLineItemInput)
+    // - DO NOT include financialStatus here (often not supported in orderCreate input)
+    // Shopify will use the variant’s actual price.
     const orderMutation = `
       mutation createOrder($order: OrderCreateOrderInput!) {
         orderCreate(order: $order) {
@@ -119,14 +171,6 @@ app.post("/api/create-order", async (req, res) => {
             id
             name
             email
-            currentSubtotalPriceSet {
-              presentmentMoney { amount currencyCode }
-              shopMoney { amount currencyCode }
-            }
-            currentTotalPriceSet {
-              presentmentMoney { amount currencyCode }
-              shopMoney { amount currencyCode }
-            }
           }
           userErrors {
             field
@@ -136,48 +180,49 @@ app.post("/api/create-order", async (req, res) => {
       }
     `;
 
-    // This object must satisfy OrderCreateOrderInput directly.
     const orderInput = {
       email: email || "no-email@example.com",
       lineItems: [
         {
-          quantity: quantity,
+          quantity: qty,
           variantId: variantId,
-
-          // 🔥 Force unit price as 318 CNY.
-          // Shopify derives its price sets from this field.
-          originalUnitPrice: {
-            amount: CN_UNIT_PRICE_CNY,
-            currencyCode: "CNY"
-          }
-        }
+        },
       ],
       tags: ["WeChat Mini Program"],
-      note: note || "Order from WeChat Mini Program (WeChat Pay ¥318)",
-      financialStatus: "PAID"
+      note: note || "Order from WeChat Mini Program",
     };
 
-    // IMPORTANT: variable $order is the OrderCreateOrderInput itself
-    const orderData = await shopifyAdminGraphQL(orderMutation, { order: orderInput });
+    const orderData = await shopifyAdminGraphQL(orderMutation, {
+      order: orderInput,
+    });
+
     const result = orderData.orderCreate;
 
     if (result.userErrors && result.userErrors.length) {
       console.error("orderCreate userErrors", result.userErrors);
-      return res.status(400).json({ error: "Shopify order error", details: result.userErrors });
+      return res.status(400).json({
+        error: "Shopify order error",
+        details: result.userErrors,
+      });
     }
 
-    res.json({
+    return res.json({
       success: true,
-      order: result.order
+      order: result.order,
     });
   } catch (err) {
     console.error("POST /api/create-order error", err);
-    res.status(500).json({ error: "Internal error" });
+    return res.status(500).json({
+      error: "Internal error",
+      message: err?.message || String(err),
+      shopifyErrors: err?.shopifyErrors,
+      shopify: err?.shopify,
+    });
   }
 });
 
 // ---- Start server ----
-const PORT = process.env.PORT || 3000;
+const PORT = process.env.PORT || 10000;
 app.listen(PORT, () => {
   console.log("Wechat-Shopify server running on port", PORT);
 });
