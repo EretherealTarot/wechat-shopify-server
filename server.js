@@ -1,19 +1,18 @@
-// server.js (tiny Shopify bridge for WeChat) — FIXED
+// server.js (tiny Shopify bridge for WeChat) — FIXED (no cors dependency)
 const express = require("express");
 const fetch = require("node-fetch"); // node-fetch@2
-const cors = require("cors");
 
 const app = express();
 app.use(express.json({ limit: "2mb" }));
 
-// Allow requests from WeChat DevTools / devices
-app.use(
-  cors({
-    origin: "*",
-    methods: ["GET", "POST", "OPTIONS"],
-    allowedHeaders: ["Content-Type", "Authorization"],
-  })
-);
+// Simple CORS (no dependency)
+app.use((req, res, next) => {
+  res.setHeader("Access-Control-Allow-Origin", "*");
+  res.setHeader("Access-Control-Allow-Methods", "GET,POST,OPTIONS");
+  res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization");
+  if (req.method === "OPTIONS") return res.sendStatus(204);
+  next();
+});
 
 // ---- CONFIG: real values via env ----
 // NOTE: Keep your existing env var names so Render doesn't need changes.
@@ -159,11 +158,7 @@ app.post("/api/create-order", async (req, res) => {
 
     const variantId = product.variants.edges[0].node.id;
 
-    // 2) Create the order
-    // IMPORTANT:
-    // - DO NOT include originalUnitPrice (not supported in OrderCreateLineItemInput)
-    // - DO NOT include financialStatus here (often not supported in orderCreate input)
-    // Shopify will use the variant’s actual price.
+    // 2) Create the order (NO originalUnitPrice, NO financialStatus)
     const orderMutation = `
       mutation createOrder($order: OrderCreateOrderInput!) {
         orderCreate(order: $order) {
