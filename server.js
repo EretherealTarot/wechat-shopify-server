@@ -21,15 +21,17 @@ const ADMIN_TOKEN = process.env.SHOPIFY_ADMIN_TOKEN || "";
 const API_VERSION = process.env.SHOPIFY_API_VERSION || "2024-07";
 
 // ---- WeChat (for openid) ----
-const WX_APPID = process.env.WX_APPID || "";      // your mini program appid
-const WX_SECRET = process.env.WX_SECRET || "";    // your mini program secret
+const WX_APPID = process.env.WX_APPID || "";
+const WX_SECRET = process.env.WX_SECRET || "";
 
 // ---- NihaoPay ----
-const NIHAOPAY_TOKEN = process.env.NIHAOPAY_TOKEN || "";    // Bearer token from NihaoPay
-const NIHAOPAY_APP_ID = process.env.NIHAOPAY_APP_ID || "";  // mini program appid registered with NihaoPay
-const NIHAOPAY_IPN_URL = process.env.NIHAOPAY_IPN_URL || ""; // public URL NihaoPay calls (this server + /api/nihao/ipn)
+const NIHAOPAY_TOKEN = process.env.NIHAOPAY_TOKEN || "";
+const NIHAOPAY_IPN_URL = process.env.NIHAOPAY_IPN_URL || "";
 
-// In-memory payment store (OK for MVP; for production use DB/Redis)
+// Optional: merchant id (NOT required by micropay API call in this flow)
+const NIHAOPAY_MERCHANT_ID = process.env.NIHAOPAY_MERCHANT_ID || "";
+
+// In-memory payment store (OK for MVP; production should use DB/Redis)
 const payments = new Map(); // paymentId(reference) -> { status, amountFen, items, address, remark, nihaoTxId, orderId }
 
 function assertEnv(name, val) {
@@ -47,13 +49,11 @@ function toFen(amountCNY) {
 }
 
 function genReference() {
-  // <=30 chars, alphanumeric
   const rand = crypto.randomBytes(4).toString("hex"); // 8 chars
   return `wx${Date.now()}${rand}`.slice(0, 30);
 }
 
 function getClientIp(req) {
-  // Render / proxies
   const xf = req.headers["x-forwarded-for"];
   if (xf) return String(xf).split(",")[0].trim();
   if (req.ip) return req.ip.replace("::ffff:", "");
@@ -133,10 +133,9 @@ async function wechatCodeToOpenId(code) {
 
 async function nihaoMicropay({ rmb_amount, reference, open_id, client_ip, description, note }) {
   assertEnv("NIHAOPAY_TOKEN", NIHAOPAY_TOKEN);
-  assertEnv("NIHAOPAY_APP_ID", NIHAOPAY_APP_ID);
   assertEnv("NIHAOPAY_IPN_URL", NIHAOPAY_IPN_URL);
+  assertEnv("WX_APPID", WX_APPID); // <-- KEY: use WeChat AppID as NihaoPay app_id
 
-  // NihaoPay expects form-encoded body
   const form = new URLSearchParams();
   form.set("currency", "CNY");
   form.set("rmb_amount", String(rmb_amount));
@@ -144,7 +143,13 @@ async function nihaoMicropay({ rmb_amount, reference, open_id, client_ip, descri
   form.set("ipn_url", NIHAOPAY_IPN_URL);
   form.set("open_id", open_id);
   form.set("client_ip", client_ip);
-  form.set("app_id", NIHAOPAY_APP_ID);
+
+  // IMPORTANT: NihaoPay "app_id" here is your WeChat Mini Program AppID
+  form.set("app_id", WX_APPID);
+
+  // Optional (for your own debugging/support)
+  if (NIHAOPAY_MERCHANT_ID) form.set("merchant_id", NIHAOPAY_MERCHANT_ID);
+
   if (description) form.set("description", description);
   if (note) form.set("note", note);
 
@@ -188,13 +193,13 @@ app.get("/api/stock", async (req, res) => {
     if (!productId) return res.status(400).json({ error: "Missing productId" });
 
     const query = `
-      query {
-        product(id: "${productId}") { id totalInventory }
+      query getStock($id: ID!) {
+        product(id: $id) { id totalInventory }
       }
     `;
-    const data = await shopifyAdminGraphQL(query);
-    const product = data.product;
 
+    const data = await shopifyAdminGraphQL(query, { id: productId });
+    const product = data.product;
     if (!product) return res.status(404).json({ error: "Product not found" });
 
     const qty = product.totalInventory ?? 0;
@@ -205,62 +210,7 @@ app.get("/api/stock", async (req, res) => {
   }
 });
 
-// (Old) create-order — keep for now, but you should stop using it from the mini program.
-app.post("/api/create-order", async (req, res) => {
-  try {
-    const { productId, quantity, email, note } = req.body || {};
-    if (!productId || !quantity) return res.status(400).json({ error: "Missing productId or quantity" });
-
-    const qty = Number(quantity);
-    if (!Number.isFinite(qty) || qty <= 0) return res.status(400).json({ error: "Invalid quantity" });
-
-    const variantQuery = `
-      query getVariant($id: ID!) {
-        product(id: $id) {
-          id
-          title
-          variants(first: 1) { edges { node { id } } }
-        }
-      }
-    `;
-
-    const varData = await shopifyAdminGraphQL(variantQuery, { id: productId });
-    const product = varData.product;
-    if (!product || !product.variants?.edges?.length) return res.status(404).json({ error: "Product or variant not found" });
-
-    const variantId = product.variants.edges[0].node.id;
-
-    const orderMutation = `
-      mutation createOrder($order: OrderCreateOrderInput!) {
-        orderCreate(order: $order) {
-          order { id name email }
-          userErrors { field message }
-        }
-      }
-    `;
-
-    const orderInput = {
-      email: email || "no-email@example.com",
-      lineItems: [{ quantity: qty, variantId }],
-      tags: ["WeChat Mini Program"],
-      note: note || "Order from WeChat Mini Program",
-    };
-
-    const orderData = await shopifyAdminGraphQL(orderMutation, { order: orderInput });
-    const result = orderData.orderCreate;
-
-    if (result.userErrors && result.userErrors.length) {
-      return res.status(400).json({ error: "Shopify order error", details: result.userErrors });
-    }
-
-    return res.json({ success: true, order: result.order });
-  } catch (err) {
-    console.error("POST /api/create-order error", err);
-    return res.status(500).json({ error: "Internal error", message: err?.message || String(err) });
-  }
-});
-
-// ✅ 1) PREPAY (NihaoPay → returns wx.requestPayment params)
+// ✅ PREPAY (NihaoPay → returns wx.requestPayment params)
 app.post("/api/pay/prepay", async (req, res) => {
   try {
     const { wxCode, amountCNY, items, address, remark } = req.body || {};
@@ -274,7 +224,6 @@ app.post("/api/pay/prepay", async (req, res) => {
 
     const paymentId = genReference();
 
-    // Save draft payment (pending)
     payments.set(paymentId, {
       status: "pending",
       amountFen,
@@ -285,7 +234,6 @@ app.post("/api/pay/prepay", async (req, res) => {
       orderId: null
     });
 
-    // NihaoPay micropay: returns timeStamp/nonceStr/wechatPackage/signType/paySign :contentReference[oaicite:3]{index=3}
     const np = await nihaoMicropay({
       rmb_amount: amountFen,
       reference: paymentId,
@@ -295,52 +243,51 @@ app.post("/api/pay/prepay", async (req, res) => {
       note: remark || "WeChat Mini Program"
     });
 
-    // Map wechatPackage -> package for wx.requestPayment
     return res.json({
       paymentId,
       timeStamp: np.timeStamp,
       nonceStr: np.nonceStr,
-      package: np.wechatPackage, // IMPORTANT
+      package: np.wechatPackage, // IMPORTANT: must be "prepay_id=..."
       signType: np.signType,
       paySign: np.paySign
     });
   } catch (err) {
     console.error("POST /api/pay/prepay error", err);
-    return res.status(500).json({ error: "Internal error", message: err?.message || String(err), detail: err?.nihao || err?.wechat });
+    return res.status(500).json({
+      error: "Internal error",
+      message: err?.message || String(err),
+      detail: err?.nihao || err?.wechat
+    });
   }
 });
 
-// ✅ 2) IPN (NihaoPay calls this after payment completes) :contentReference[oaicite:4]{index=4}
+// ✅ IPN (NihaoPay calls this after payment completes)
 app.post("/api/nihao/ipn", async (req, res) => {
   try {
-    // NihaoPay posts a transaction object to ipn_url
     const tx = req.body || {};
     const reference = tx.reference;
 
     if (reference && payments.has(reference)) {
       const p = payments.get(reference);
 
-      // tx.status is usually "success" when paid :contentReference[oaicite:5]{index=5}
       if (tx.status === "success") {
         p.status = "paid";
         p.nihaoTxId = tx.id || p.nihaoTxId;
-        payments.set(reference, p);
       } else if (tx.status === "failure") {
         p.status = "failed";
         p.nihaoTxId = tx.id || p.nihaoTxId;
-        payments.set(reference, p);
       }
+      payments.set(reference, p);
     }
 
-    // NihaoPay expects a 200 response
     return res.status(200).json({ ok: true });
   } catch (err) {
     console.error("POST /api/nihao/ipn error", err);
-    return res.status(200).json({ ok: true }); // still return 200 to avoid retries spiraling
+    return res.status(200).json({ ok: true });
   }
 });
 
-// ✅ 3) Create Shopify order ONLY if payment is confirmed paid
+// ✅ Create Shopify order ONLY if payment confirmed paid
 app.post("/api/order/create-paid", async (req, res) => {
   try {
     const { paymentId, items, address, remark } = req.body || {};
@@ -349,23 +296,20 @@ app.post("/api/order/create-paid", async (req, res) => {
     const p = payments.get(paymentId);
     if (!p) return res.status(404).json({ error: "Unknown paymentId" });
 
-    // idempotency: if already created, return it
     if (p.orderId) {
       return res.json({ success: true, orderId: p.orderId, alreadyCreated: true });
     }
 
-    // Must be paid (IPN confirms). If IPN hasn’t arrived yet, return 409 so the app can retry.
     if (p.status !== "paid") {
       return res.status(409).json({ error: "PAYMENT_NOT_CONFIRMED", status: p.status });
     }
 
-    // Build shipping address for Shopify
     const ship = address || p.address || {};
     const fullName = ship.userName || "WeChat Customer";
 
     const shippingAddress = {
       address1: ship.detailInfo || "",
-      address2: ship.detailInfo2 || "",
+      address2: "",
       city: ship.cityName || "",
       province: ship.provinceName || "",
       zip: ship.postalCode || "",
@@ -375,7 +319,6 @@ app.post("/api/order/create-paid", async (req, res) => {
       phone: ship.telNumber || ""
     };
 
-    // Convert cart items -> Shopify line items (variantId + quantity)
     const lineItems = (items || p.items || []).map((it) => ({
       variantId: it.variantId,
       quantity: Number(it.quantity) || 1
@@ -407,7 +350,6 @@ app.post("/api/order/create-paid", async (req, res) => {
       return res.status(400).json({ error: "Shopify order error", details: result.userErrors });
     }
 
-    // Save orderId to prevent duplicates
     p.orderId = result.order.id;
     payments.set(paymentId, p);
 
