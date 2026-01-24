@@ -1,4 +1,17 @@
-// server.js (NihaoPay + Shopify bridge for WeChat Mini Program)
+// server.js — WeChat Mini Program + NihaoPay + Shopify bridge (FULL)
+//
+// Requires env vars on Render:
+// - SHOPIFY_DOMAIN (optional; default set)
+// - SHOPIFY_ADMIN_TOKEN (required)
+// - SHOPIFY_API_VERSION (optional; default 2024-07)
+// - WX_APPID (required)
+// - WX_SECRET (required)
+// - NIHAOPAY_TOKEN (required; Bearer token from TMS -> Settings -> Certificate)
+// - NIHAOPAY_IPN_URL (required; https://<your-render>/api/nihao/ipn)
+//
+// Optional:
+// - PORT
+
 const express = require("express");
 const fetch = require("node-fetch"); // node-fetch@2
 const crypto = require("crypto");
@@ -6,7 +19,7 @@ const crypto = require("crypto");
 const app = express();
 app.use(express.json({ limit: "2mb" }));
 
-// Simple CORS
+// Simple CORS (no dependency)
 app.use((req, res, next) => {
   res.setHeader("Access-Control-Allow-Origin", "*");
   res.setHeader("Access-Control-Allow-Methods", "GET,POST,OPTIONS");
@@ -15,24 +28,23 @@ app.use((req, res, next) => {
   next();
 });
 
-// ---- Shopify ----
+// ------------------- CONFIG -------------------
 const SHOPIFY_DOMAIN = process.env.SHOPIFY_DOMAIN || "edd11f-2.myshopify.com";
 const ADMIN_TOKEN = process.env.SHOPIFY_ADMIN_TOKEN || "";
 const API_VERSION = process.env.SHOPIFY_API_VERSION || "2024-07";
 
-// ---- WeChat (for openid) ----
 const WX_APPID = process.env.WX_APPID || "";
 const WX_SECRET = process.env.WX_SECRET || "";
 
-// ---- NihaoPay ----
 const NIHAOPAY_TOKEN = process.env.NIHAOPAY_TOKEN || "";
 const NIHAOPAY_IPN_URL = process.env.NIHAOPAY_IPN_URL || "";
 
-// Optional: merchant id (NOT required by micropay API call in this flow)
-const NIHAOPAY_MERCHANT_ID = process.env.NIHAOPAY_MERCHANT_ID || "";
+// If your settlement currency is NOT CAD, change this to "USD" etc.
+const SETTLEMENT_CURRENCY = "CAD";
 
-// In-memory payment store (OK for MVP; production should use DB/Redis)
-const payments = new Map(); // paymentId(reference) -> { status, amountFen, items, address, remark, nihaoTxId, orderId }
+// In-memory payment store (MVP). Production should use DB/Redis.
+const payments = new Map(); // paymentId -> { status, amountFen, items, address, remark, nihaoTxId, orderId, createdAt }
+// ------------------------------------------------
 
 function assertEnv(name, val) {
   if (!val) {
@@ -50,19 +62,20 @@ function toFen(amountCNY) {
 
 function genReference() {
   const rand = crypto.randomBytes(4).toString("hex"); // 8 chars
+  // NihaoPay reference length constraints vary; keep it short-ish
   return `wx${Date.now()}${rand}`.slice(0, 30);
 }
 
 function getClientIp(req) {
   const xf = req.headers["x-forwarded-for"];
   if (xf) return String(xf).split(",")[0].trim();
-  if (req.ip) return req.ip.replace("::ffff:", "");
+  if (req.ip) return String(req.ip).replace("::ffff:", "");
   return "127.0.0.1";
 }
 
 async function shopifyAdminGraphQL(query, variables = {}) {
   if (!ADMIN_TOKEN) {
-    const err = new Error("Missing ADMIN_TOKEN (SHOPIFY_ADMIN_TOKEN on Render)");
+    const err = new Error("Missing SHOPIFY_ADMIN_TOKEN on Render");
     err.code = "MISSING_ADMIN_TOKEN";
     throw err;
   }
@@ -78,8 +91,9 @@ async function shopifyAdminGraphQL(query, variables = {}) {
 
   const text = await res.text();
   let json;
-  try { json = JSON.parse(text); }
-  catch {
+  try {
+    json = JSON.parse(text);
+  } catch (e) {
     const err = new Error(`Shopify returned non-JSON. HTTP ${res.status}. Body: ${text}`);
     err.httpStatus = res.status;
     throw err;
@@ -131,24 +145,36 @@ async function wechatCodeToOpenId(code) {
   return json.openid;
 }
 
-async function nihaoMicropay({ rmb_amount, reference, open_id, client_ip, description, note }) {
+// ------------------- NihaoPay micropay -------------------
+// We send:
+// - currency = SETTLEMENT_CURRENCY (CAD)  <-- settlement currency
+// - rmb_amount = amountFen (RMB in fen)   <-- customer-facing RMB charge
+async function nihaoMicropay({ amountFen, reference, openId, clientIp, description, note }) {
   assertEnv("NIHAOPAY_TOKEN", NIHAOPAY_TOKEN);
   assertEnv("NIHAOPAY_IPN_URL", NIHAOPAY_IPN_URL);
-  assertEnv("WX_APPID", WX_APPID); // <-- KEY: use WeChat AppID as NihaoPay app_id
+  assertEnv("WX_APPID", WX_APPID);
+
+  // Debug (safe)
+  console.log("[nihao] app_id:", WX_APPID);
+  console.log("[nihao] token length:", (NIHAOPAY_TOKEN || "").trim().length);
+  console.log(
+    "[nihao] open_id:",
+    openId ? `${openId.slice(0, 6)}...${openId.slice(-4)}` : "EMPTY"
+  );
 
   const form = new URLSearchParams();
-  form.set("currency", "CNY");
-  form.set("rmb_amount", String(rmb_amount));
+
+  // NihaoPay guidance: currency is settlement currency, RMB via rmb_amount
+  form.set("currency", SETTLEMENT_CURRENCY);
+  form.set("rmb_amount", String(amountFen));
+
   form.set("reference", reference);
   form.set("ipn_url", NIHAOPAY_IPN_URL);
-  form.set("open_id", open_id);
-  form.set("client_ip", client_ip);
+  form.set("open_id", openId);
+  form.set("client_ip", clientIp);
 
-  // IMPORTANT: NihaoPay "app_id" here is your WeChat Mini Program AppID
+  // For Mini Program / JSAPI: app_id is the WeChat Mini Program AppID
   form.set("app_id", WX_APPID);
-
-  // Optional (for your own debugging/support)
-  if (NIHAOPAY_MERCHANT_ID) form.set("merchant_id", NIHAOPAY_MERCHANT_ID);
 
   if (description) form.set("description", description);
   if (note) form.set("note", note);
@@ -156,7 +182,7 @@ async function nihaoMicropay({ rmb_amount, reference, open_id, client_ip, descri
   const res = await fetch("https://api.nihaopay.com/v1.2/transactions/micropay", {
     method: "POST",
     headers: {
-      "Authorization": `Bearer ${NIHAOPAY_TOKEN}`,
+      Authorization: `Bearer ${NIHAOPAY_TOKEN}`,
       "Content-Type": "application/x-www-form-urlencoded",
     },
     body: form.toString(),
@@ -164,12 +190,17 @@ async function nihaoMicropay({ rmb_amount, reference, open_id, client_ip, descri
 
   const text = await res.text();
   let json;
-  try { json = JSON.parse(text); }
-  catch {
+  try {
+    json = JSON.parse(text);
+  } catch (e) {
     const err = new Error(`NihaoPay non-JSON. HTTP ${res.status}. Body: ${text}`);
     err.httpStatus = res.status;
     throw err;
   }
+
+  // Log full response for support (it contains traceId)
+  console.log("[nihao] response http:", res.status);
+  console.log("[nihao] response body:", json);
 
   if (!res.ok) {
     const err = new Error(`NihaoPay HTTP ${res.status}: ${text}`);
@@ -180,6 +211,8 @@ async function nihaoMicropay({ rmb_amount, reference, open_id, client_ip, descri
 
   return json;
 }
+
+// ------------------- ROUTES -------------------
 
 // Health check
 app.get("/", (_req, res) => {
@@ -197,7 +230,6 @@ app.get("/api/stock", async (req, res) => {
         product(id: $id) { id totalInventory }
       }
     `;
-
     const data = await shopifyAdminGraphQL(query, { id: productId });
     const product = data.product;
     if (!product) return res.status(404).json({ error: "Product not found" });
@@ -210,7 +242,7 @@ app.get("/api/stock", async (req, res) => {
   }
 });
 
-// ✅ PREPAY (NihaoPay → returns wx.requestPayment params)
+// PREPAY: Mini Program -> server -> WeChat openid -> NihaoPay micropay -> return wx.requestPayment params
 app.post("/api/pay/prepay", async (req, res) => {
   try {
     const { wxCode, amountCNY, items, address, remark } = req.body || {};
@@ -220,8 +252,12 @@ app.post("/api/pay/prepay", async (req, res) => {
     if (!amountFen) return res.status(400).json({ error: "Invalid amountCNY" });
 
     const openid = await wechatCodeToOpenId(wxCode);
-    const client_ip = getClientIp(req);
+    console.log(
+      "[prepay] openid ok:",
+      openid ? `${openid.slice(0, 6)}...${openid.slice(-4)}` : "EMPTY"
+    );
 
+    const clientIp = getClientIp(req);
     const paymentId = genReference();
 
     payments.set(paymentId, {
@@ -231,41 +267,47 @@ app.post("/api/pay/prepay", async (req, res) => {
       address: address || null,
       remark: remark || "",
       nihaoTxId: null,
-      orderId: null
+      orderId: null,
+      createdAt: Date.now(),
     });
 
     const np = await nihaoMicropay({
-      rmb_amount: amountFen,
+      amountFen,
       reference: paymentId,
-      open_id: openid,
-      client_ip,
+      openId: openid,
+      clientIp,
       description: "Erethereal WeChat Mini Program",
-      note: remark || "WeChat Mini Program"
+      note: remark || "WeChat Mini Program",
     });
 
+    // NihaoPay returns fields used by wx.requestPayment
+    // Keep names EXACT as returned from NihaoPay; package is often "prepay_id=..."
     return res.json({
       paymentId,
       timeStamp: np.timeStamp,
       nonceStr: np.nonceStr,
-      package: np.wechatPackage, // IMPORTANT: must be "prepay_id=..."
+      package: np.wechatPackage, // must be string like "prepay_id=xxxxx"
       signType: np.signType,
-      paySign: np.paySign
+      paySign: np.paySign,
     });
   } catch (err) {
     console.error("POST /api/pay/prepay error", err);
     return res.status(500).json({
       error: "Internal error",
       message: err?.message || String(err),
-      detail: err?.nihao || err?.wechat
+      detail: err?.nihao || err?.wechat,
     });
   }
 });
 
-// ✅ IPN (NihaoPay calls this after payment completes)
+// IPN: NihaoPay notifies us of transaction status
 app.post("/api/nihao/ipn", async (req, res) => {
   try {
     const tx = req.body || {};
+    // Expecting tx.reference and tx.status (success/failure)
     const reference = tx.reference;
+
+    console.log("[ipn] received:", tx);
 
     if (reference && payments.has(reference)) {
       const p = payments.get(reference);
@@ -277,9 +319,14 @@ app.post("/api/nihao/ipn", async (req, res) => {
         p.status = "failed";
         p.nihaoTxId = tx.id || p.nihaoTxId;
       }
+
       payments.set(reference, p);
+      console.log("[ipn] updated payment:", reference, p.status);
+    } else {
+      console.log("[ipn] unknown reference:", reference);
     }
 
+    // Always 200 so NihaoPay doesn't keep retrying forever
     return res.status(200).json({ ok: true });
   } catch (err) {
     console.error("POST /api/nihao/ipn error", err);
@@ -287,7 +334,7 @@ app.post("/api/nihao/ipn", async (req, res) => {
   }
 });
 
-// ✅ Create Shopify order ONLY if payment confirmed paid
+// Create Shopify order ONLY after payment confirmed "paid" (via IPN)
 app.post("/api/order/create-paid", async (req, res) => {
   try {
     const { paymentId, items, address, remark } = req.body || {};
@@ -304,6 +351,7 @@ app.post("/api/order/create-paid", async (req, res) => {
       return res.status(409).json({ error: "PAYMENT_NOT_CONFIRMED", status: p.status });
     }
 
+    // Build shipping address from WeChat chooseAddress payload
     const ship = address || p.address || {};
     const fullName = ship.userName || "WeChat Customer";
 
@@ -316,12 +364,12 @@ app.post("/api/order/create-paid", async (req, res) => {
       country: "China",
       firstName: fullName,
       lastName: "",
-      phone: ship.telNumber || ""
+      phone: ship.telNumber || "",
     };
 
     const lineItems = (items || p.items || []).map((it) => ({
       variantId: it.variantId,
-      quantity: Number(it.quantity) || 1
+      quantity: Number(it.quantity) || 1,
     }));
 
     if (!lineItems.length) return res.status(400).json({ error: "No line items" });
@@ -340,7 +388,9 @@ app.post("/api/order/create-paid", async (req, res) => {
       shippingAddress,
       lineItems,
       tags: ["WeChat Mini Program", "NihaoPay", `payment:${paymentId}`],
-      note: `Paid via NihaoPay. paymentId=${paymentId}\n备注: ${remark || p.remark || ""}\nTel: ${ship.telNumber || ""}`
+      note: `Paid via NihaoPay. paymentId=${paymentId}\n备注: ${remark || p.remark || ""}\nTel: ${
+        ship.telNumber || ""
+      }`,
     };
 
     const orderData = await shopifyAdminGraphQL(orderMutation, { order: orderInput });
@@ -360,7 +410,7 @@ app.post("/api/order/create-paid", async (req, res) => {
   }
 });
 
-// Start server
+// ------------------- START SERVER -------------------
 const PORT = process.env.PORT || 10000;
 app.listen(PORT, () => {
   console.log("Wechat-Shopify server running on port", PORT);
