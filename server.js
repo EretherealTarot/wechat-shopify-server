@@ -1,16 +1,4 @@
-// server.js — WeChat Mini Program + NihaoPay + Shopify bridge (FULL)
-//
-// Requires env vars on Render:
-// - SHOPIFY_DOMAIN (optional; default set)
-// - SHOPIFY_ADMIN_TOKEN (required)
-// - SHOPIFY_API_VERSION (optional; default 2024-07)
-// - WX_APPID (required)
-// - WX_SECRET (required)
-// - NIHAOPAY_TOKEN (required)
-// - NIHAOPAY_IPN_URL (required)
-//
-// Optional:
-// - PORT
+// server.js — WeChat Mini Program + NihaoPay + Shopify bridge (FULL, hardened orders by openid)
 
 const express = require("express");
 const fetch = require("node-fetch"); // node-fetch@2
@@ -39,11 +27,10 @@ const WX_SECRET = process.env.WX_SECRET || "";
 const NIHAOPAY_TOKEN = process.env.NIHAOPAY_TOKEN || "";
 const NIHAOPAY_IPN_URL = process.env.NIHAOPAY_IPN_URL || "";
 
-// If your settlement currency is NOT CAD, change this to "USD" etc.
 const SETTLEMENT_CURRENCY = "CAD";
 
 // In-memory payment store (MVP). Production should use DB/Redis.
-const payments = new Map(); // paymentId -> { status, amountFen, items, address, remark, nihaoTxId, orderId, createdAt }
+const payments = new Map(); // paymentId -> { status, amountFen, items, address, remark, nihaoTxId, orderId, openid, createdAt }
 
 // ------------------- HELPERS -------------------
 function assertEnv(name, val) {
@@ -73,14 +60,12 @@ function getClientIp(req) {
 }
 
 function normalizePhone(phone) {
-  // keep digits and + only
   return String(phone || "").replace(/[^\d+]/g, "");
 }
 
-// tag format we will attach to Shopify orders (guaranteed searchable)
-function phoneTag(phone) {
-  const p = normalizePhone(phone);
-  return p ? `wx_phone:${p}` : "";
+function openidTag(openid) {
+  const id = String(openid || "").trim();
+  return id ? `wx_openid:${id}` : "";
 }
 
 async function shopifyAdminGraphQL(query, variables = {}) {
@@ -252,7 +237,7 @@ app.get("/api/stock", async (req, res) => {
   }
 });
 
-// PREPAY: Mini Program -> server -> WeChat openid -> NihaoPay micropay -> return wx.requestPayment params
+// PREPAY
 app.post("/api/pay/prepay", async (req, res) => {
   try {
     const { wxCode, amountCNY, items, address, remark } = req.body || {};
@@ -273,6 +258,7 @@ app.post("/api/pay/prepay", async (req, res) => {
       remark: remark || "",
       nihaoTxId: null,
       orderId: null,
+      openid,
       createdAt: Date.now()
     });
 
@@ -303,7 +289,7 @@ app.post("/api/pay/prepay", async (req, res) => {
   }
 });
 
-// IPN: NihaoPay notifies us of transaction status
+// IPN
 app.post("/api/nihao/ipn", async (req, res) => {
   try {
     const tx = req.body || {};
@@ -330,7 +316,7 @@ app.post("/api/nihao/ipn", async (req, res) => {
   }
 });
 
-// Create Shopify order ONLY after payment confirmed "paid" (via IPN)
+// Create Shopify order ONLY after payment confirmed "paid"
 app.post("/api/order/create-paid", async (req, res) => {
   try {
     const { paymentId, items, address, remark, customerPhone } = req.body || {};
@@ -350,7 +336,6 @@ app.post("/api/order/create-paid", async (req, res) => {
     const ship = address || p.address || {};
     const fullName = ship.userName || "WeChat Customer";
 
-    // ✅ normalize phone (prefer explicit customerPhone, else WeChat address telNumber)
     const phone = normalizePhone(customerPhone || ship.telNumber || "");
 
     const shippingAddress = {
@@ -381,25 +366,22 @@ app.post("/api/order/create-paid", async (req, res) => {
       }
     `;
 
-    // ✅ add guaranteed-search tag
-    const pTag = phoneTag(phone);
+    const oidTag = openidTag(p.openid);
 
     const orderInput = {
       email: "no-email@example.com",
       shippingAddress,
       lineItems,
-
       tags: [
         "WeChat Mini Program",
         "NihaoPay",
         `payment:${paymentId}`,
-        ...(pTag ? [pTag] : [])
+        ...(oidTag ? [oidTag] : [])
       ],
-
-      // ✅ make phone appear in note cleanly
       note:
         `Paid via NihaoPay. paymentId=${paymentId}\n` +
         (phone ? `Tel: ${phone}\n` : "") +
+        (p.openid ? `OpenID: ${p.openid}\n` : "") +
         `备注: ${remark || p.remark || ""}`
     };
 
@@ -420,7 +402,7 @@ app.post("/api/order/create-paid", async (req, res) => {
   }
 });
 
-// ------------------- ORDERS (READ-ONLY) -------------------
+// ------------------- ORDERS (READ-ONLY, HARDENED by openid) -------------------
 
 const ORDER_LIST_QUERY = `
 query Orders($query: String!) {
@@ -431,6 +413,7 @@ query Orders($query: String!) {
       createdAt
       displayFinancialStatus
       displayFulfillmentStatus
+      tags
       currentTotalPriceSet { shopMoney { amount currencyCode } }
       lineItems(first: 5) { nodes { title quantity } }
     }
@@ -446,6 +429,7 @@ query Order($id: ID!) {
     createdAt
     displayFinancialStatus
     displayFulfillmentStatus
+    tags
     currentSubtotalPriceSet { shopMoney { amount } }
     totalShippingPriceSet { shopMoney { amount } }
     currentTotalPriceSet { shopMoney { amount } }
@@ -468,25 +452,31 @@ query Order($id: ID!) {
 }
 `;
 
+async function requireOpenidFromReq(req) {
+  const code = (req.query.code || req.body?.code || "").toString();
+  if (!code) {
+    const err = new Error("Missing code");
+    err.http = 401;
+    throw err;
+  }
+  const openid = await wechatCodeToOpenId(code);
+  if (!openid) {
+    const err = new Error("Invalid code");
+    err.http = 401;
+    throw err;
+  }
+  return openid;
+}
+
+// GET /api/orders?code=wxlogin_code
 app.get("/api/orders", async (req, res) => {
   try {
-    const phone = normalizePhone(req.query.phone);
-    if (!phone) return res.status(400).json({ error: "Missing phone" });
+    const openid = await requireOpenidFromReq(req);
+    const tag = openidTag(openid);
+    if (!tag) return res.status(401).json({ error: "Unauthorized" });
 
-    // ✅ Try multiple search strategies:
-    // 1) phone: (works if Shopify indexed phone)
-    // 2) tag:wx_phone: (guaranteed because we add this tag)
-    const queries = [
-      `phone:${phone}`,
-      `tag:${phoneTag(phone)}`
-    ];
-
-    let nodes = [];
-    for (const q of queries) {
-      const data = await shopifyAdminGraphQL(ORDER_LIST_QUERY, { query: q });
-      nodes = (data.orders && data.orders.nodes) ? data.orders.nodes : [];
-      if (nodes.length) break;
-    }
+    const data = await shopifyAdminGraphQL(ORDER_LIST_QUERY, { query: `tag:${tag}` });
+    const nodes = (data.orders && data.orders.nodes) ? data.orders.nodes : [];
 
     const out = (nodes || []).map((o) => {
       const status = toMiniStatus(o.displayFinancialStatus, o.displayFulfillmentStatus);
@@ -504,19 +494,27 @@ app.get("/api/orders", async (req, res) => {
     res.json(out);
   } catch (e) {
     console.error(e);
-    res.status(500).json({ error: e.message });
+    res.status(e.http || 500).json({ error: e.message || "error" });
   }
 });
 
+// GET /api/orders/:id?code=wxlogin_code
 app.get("/api/orders/:id", async (req, res) => {
   try {
-    const data = await shopifyAdminGraphQL(ORDER_DETAIL_QUERY, { id: req.params.id });
+    const openid = await requireOpenidFromReq(req);
+    const tag = openidTag(openid);
 
+    const data = await shopifyAdminGraphQL(ORDER_DETAIL_QUERY, { id: req.params.id });
     const o = data.order;
     if (!o) return res.status(404).json({ error: "Order not found" });
 
-    const status = toMiniStatus(o.displayFinancialStatus, o.displayFulfillmentStatus);
+    // ✅ ownership check
+    const tags = Array.isArray(o.tags) ? o.tags : [];
+    if (!tags.includes(tag)) {
+      return res.status(403).json({ error: "Forbidden" });
+    }
 
+    const status = toMiniStatus(o.displayFinancialStatus, o.displayFulfillmentStatus);
     const addr = o.shippingAddress || {};
     const tracking = o.fulfillments?.[0]?.trackingInfo?.[0];
 
@@ -545,7 +543,7 @@ app.get("/api/orders/:id", async (req, res) => {
     });
   } catch (e) {
     console.error(e);
-    res.status(500).json({ error: e.message });
+    res.status(e.http || 500).json({ error: e.message || "error" });
   }
 });
 
@@ -554,4 +552,3 @@ const PORT = process.env.PORT || 10000;
 app.listen(PORT, () => {
   console.log("Wechat-Shopify server running on port", PORT);
 });
-
