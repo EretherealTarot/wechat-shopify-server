@@ -1,4 +1,4 @@
-// server.js — WeChat Mini Program + NihaoPay + Shopify bridge + Orders API + Shipping subscription message
+// server.js — WeChat Mini Program + NihaoPay + Shopify bridge (FULL, with Orders API + Shipping Subscribe Message)
 
 const express = require("express");
 const fetch = require("node-fetch"); // node-fetch@2
@@ -6,33 +6,19 @@ const crypto = require("crypto");
 
 const app = express();
 
-// IMPORTANT: need rawBody for Shopify webhook HMAC
+// IMPORTANT: for Shopify webhooks, we need RAW body to verify HMAC.
+// We'll use a special raw parser only on /api/shopify/webhook, and normal JSON elsewhere.
 app.use((req, res, next) => {
-  let data = "";
-  req.setEncoding("utf8");
-  req.on("data", (chunk) => (data += chunk));
-  req.on("end", () => {
-    req.rawBody = data;
-    next();
-  });
-});
-
-app.use((req, res, next) => {
-  if (req.method === "POST" || req.method === "PUT") {
-    try {
-      req.body = req.rawBody ? JSON.parse(req.rawBody) : {};
-    } catch (e) {
-      req.body = {};
-    }
-  }
-  next();
+  // skip JSON parsing for webhook route, handled below
+  if (req.path === "/api/shopify/webhook") return next();
+  return express.json({ limit: "2mb" })(req, res, next);
 });
 
 // Simple CORS
 app.use((req, res, next) => {
   res.setHeader("Access-Control-Allow-Origin", "*");
   res.setHeader("Access-Control-Allow-Methods", "GET,POST,OPTIONS");
-  res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization, X-Shopify-Hmac-Sha256");
+  res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization, X-Shopify-Topic");
   if (req.method === "OPTIONS") return res.sendStatus(204);
   next();
 });
@@ -44,23 +30,30 @@ const API_VERSION = process.env.SHOPIFY_API_VERSION || "2024-07";
 
 const WX_APPID = process.env.WX_APPID || "";
 const WX_SECRET = process.env.WX_SECRET || "";
-const WX_SHIP_TEMPLATE_ID = process.env.WX_SHIP_TEMPLATE_ID || "";
 
 const NIHAOPAY_TOKEN = process.env.NIHAOPAY_TOKEN || "";
 const NIHAOPAY_IPN_URL = process.env.NIHAOPAY_IPN_URL || "";
 
-const PUBLIC_BASE_URL = process.env.PUBLIC_BASE_URL || "https://wechat-shopify-server.onrender.com";
+// This must match your WeChat subscription template ID
+const WX_SHIP_TEMPLATE_ID = process.env.WX_SHIP_TEMPLATE_ID || "";
 
+// Shopify webhook secret = string shown in Shopify admin: “Your webhooks will be signed with …”
 const SHOPIFY_WEBHOOK_SECRET = process.env.SHOPIFY_WEBHOOK_SECRET || "";
 
-const SETTLEMENT_CURRENCY = "CAD";
+// If your settlement currency is NOT CAD, change this to "USD" etc.
+const SETTLEMENT_CURRENCY = process.env.SETTLEMENT_CURRENCY || "CAD";
 
-// In-memory payment store (MVP)
-const payments = new Map(); // paymentId -> { status, amountFen, items, address, remark, nihaoTxId, orderId, openid, createdAt }
+// In-memory payment store (MVP). Production should use DB/Redis.
+// paymentId -> { status, amountFen, items, address, remark, nihaoTxId, orderId, orderName, wechatOpenId, createdAt }
+const payments = new Map();
 
 // ------------------- HELPERS -------------------
 function assertEnv(name, val) {
-  if (!val) throw new Error(`Missing env var: ${name}`);
+  if (!val) {
+    const err = new Error(`Missing env var: ${name}`);
+    err.code = "MISSING_ENV";
+    throw err;
+  }
 }
 
 function toFen(amountCNY) {
@@ -81,37 +74,20 @@ function getClientIp(req) {
   return "127.0.0.1";
 }
 
-function normalizePhone(phone) {
-  return String(phone || "").replace(/[^\d+]/g, "");
-}
-
-function toMiniStatus(fin, ful) {
-  fin = (fin || "").toUpperCase();
-  ful = (ful || "").toUpperCase();
-
-  if (fin.includes("PENDING") || fin.includes("UNPAID")) return "pending";
-  if (fin.includes("PAID") && ful.includes("UNFULFILLED")) return "paid";
-  if (ful.includes("FULFILLED")) return "shipped";
-  return "paid";
-}
-
-function badgeForStatus(status) {
-  if (status === "pending") return { badgeText: "待付款", badgeClass: "badge--pending" };
-  if (status === "paid") return { badgeText: "已付款", badgeClass: "badge--paid" };
-  if (status === "shipped") return { badgeText: "已发货", badgeClass: "badge--shipped" };
-  return { badgeText: "已完成", badgeClass: "badge--completed" };
-}
-
 async function shopifyAdminGraphQL(query, variables = {}) {
-  assertEnv("SHOPIFY_ADMIN_TOKEN", ADMIN_TOKEN);
+  if (!ADMIN_TOKEN) {
+    const err = new Error("Missing SHOPIFY_ADMIN_TOKEN on Render");
+    err.code = "MISSING_ADMIN_TOKEN";
+    throw err;
+  }
 
   const res = await fetch(`https://${SHOPIFY_DOMAIN}/admin/api/${API_VERSION}/graphql.json`, {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
-      "X-Shopify-Access-Token": ADMIN_TOKEN
+      "X-Shopify-Access-Token": ADMIN_TOKEN,
     },
-    body: JSON.stringify({ query, variables })
+    body: JSON.stringify({ query, variables }),
   });
 
   const text = await res.text();
@@ -119,12 +95,25 @@ async function shopifyAdminGraphQL(query, variables = {}) {
   try {
     json = JSON.parse(text);
   } catch (e) {
-    throw new Error(`Shopify returned non-JSON. HTTP ${res.status}. Body: ${text}`);
+    const err = new Error(`Shopify returned non-JSON. HTTP ${res.status}. Body: ${text}`);
+    err.httpStatus = res.status;
+    throw err;
   }
 
-  if (!res.ok || (json.errors && json.errors.length)) {
-    throw new Error(`Shopify error: ${JSON.stringify(json.errors || json)}`);
+  if (!res.ok) {
+    const err = new Error(`Shopify HTTP ${res.status}`);
+    err.httpStatus = res.status;
+    err.shopify = json;
+    throw err;
   }
+
+  if (json.errors && json.errors.length) {
+    const err = new Error(json.errors.map((e) => e.message).join(" | "));
+    err.httpStatus = 500;
+    err.shopifyErrors = json.errors;
+    throw err;
+  }
+
   return json.data;
 }
 
@@ -143,124 +132,32 @@ async function wechatCodeToOpenId(code) {
   const json = await res.json();
 
   if (!json || json.errcode) {
-    throw new Error(`WeChat jscode2session error: ${JSON.stringify(json)}`);
+    const err = new Error(`WeChat jscode2session error: ${JSON.stringify(json)}`);
+    err.wechat = json;
+    throw err;
   }
+
   if (!json.openid) {
-    throw new Error(`WeChat missing openid: ${JSON.stringify(json)}`);
+    const err = new Error(`WeChat missing openid: ${JSON.stringify(json)}`);
+    err.wechat = json;
+    throw err;
   }
+
   return json.openid;
 }
 
-// ---- Shopify Webhook HMAC verify ----
-function verifyShopifyHmac(req) {
-  if (!SHOPIFY_WEBHOOK_SECRET) return false;
-  const hmacHeader = req.headers["x-shopify-hmac-sha256"];
-  if (!hmacHeader) return false;
-
-  const digest = crypto
-    .createHmac("sha256", SHOPIFY_WEBHOOK_SECRET)
-    .update(req.rawBody || "", "utf8")
-    .digest("base64");
-
-  return digest === hmacHeader;
-}
-
-// ---- WeChat Access Token cache ----
-let wxTokenCache = { token: "", expiresAt: 0 };
-
-async function getWeChatAccessToken() {
-  assertEnv("WX_APPID", WX_APPID);
-  assertEnv("WX_SECRET", WX_SECRET);
-
-  const now = Date.now();
-  if (wxTokenCache.token && wxTokenCache.expiresAt > now + 60_000) {
-    return wxTokenCache.token;
-  }
-
-  const url =
-    `https://api.weixin.qq.com/cgi-bin/token?grant_type=client_credential` +
-    `&appid=${encodeURIComponent(WX_APPID)}` +
-    `&secret=${encodeURIComponent(WX_SECRET)}`;
-
-  const res = await fetch(url);
-  const json = await res.json();
-
-  if (!json || !json.access_token) {
-    throw new Error(`WeChat token error: ${JSON.stringify(json)}`);
-  }
-
-  wxTokenCache.token = json.access_token;
-  wxTokenCache.expiresAt = now + (Number(json.expires_in || 7200) * 1000);
-  return wxTokenCache.token;
-}
-
-// ---- Send subscription message ----
-// NOTE: Template “data keys” depend on WeChat template field IDs.
-// If WeChat returns a data-format error, open template “详情” and you’ll see placeholders like {{thing1.DATA}}.
-// Then we’ll map keys in WX_SHIP_DATA_KEYS env without changing code.
-function buildShipTemplateData({
-  logisticsCompany,
-  trackingNumber,
-  shipTime,
-  orderName
-}) {
-  // Default fallback (often works for older keyword templates)
-  // If your template uses thing1/date2/etc, we’ll swap keys after first real shipment.
-  return {
-    keyword1: { value: logisticsCompany || "PostNL" },
-    keyword2: { value: trackingNumber || "暂无" },
-    keyword3: { value: shipTime || "" },
-    keyword4: { value: orderName || "" }
-  };
-}
-
-async function sendWeChatShipMessage({ openid, orderGid, orderName, logisticsCompany, trackingNumber, shipTime }) {
-  if (!WX_SHIP_TEMPLATE_ID) {
-    console.log("[wx] WX_SHIP_TEMPLATE_ID missing; skip send");
-    return { skipped: true, reason: "NO_TEMPLATE_ID" };
-  }
-  if (!openid) {
-    console.log("[wx] openid missing; skip send");
-    return { skipped: true, reason: "NO_OPENID" };
-  }
-
-  const token = await getWeChatAccessToken();
-
-  const payload = {
-    touser: openid,
-    template_id: WX_SHIP_TEMPLATE_ID,
-    page: `pages/orderDetail/orderDetail?id=${encodeURIComponent(orderGid)}`,
-    data: buildShipTemplateData({ logisticsCompany, trackingNumber, shipTime, orderName })
-  };
-
-  const res = await fetch(`https://api.weixin.qq.com/cgi-bin/message/subscribe/send?access_token=${encodeURIComponent(token)}`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(payload)
-  });
-
-  const json = await res.json();
-  console.log("[wx] send result:", json);
-
-  // errcode === 0 success
-  if (!json || json.errcode !== 0) {
-    throw new Error(`WeChat send failed: ${JSON.stringify(json)}`);
-  }
-
-  return json;
-}
-
 // ------------------- NihaoPay micropay -------------------
+// We send:
+// - currency = SETTLEMENT_CURRENCY (CAD)  <-- settlement currency
+// - rmb_amount = amountFen (RMB in fen)   <-- customer-facing RMB charge
 async function nihaoMicropay({ amountFen, reference, openId, clientIp, description, note }) {
   assertEnv("NIHAOPAY_TOKEN", NIHAOPAY_TOKEN);
   assertEnv("NIHAOPAY_IPN_URL", NIHAOPAY_IPN_URL);
   assertEnv("WX_APPID", WX_APPID);
 
   const form = new URLSearchParams();
-
   form.set("currency", SETTLEMENT_CURRENCY);
   form.set("rmb_amount", String(amountFen));
-
   form.set("reference", reference);
   form.set("ipn_url", NIHAOPAY_IPN_URL);
   form.set("open_id", openId);
@@ -274,9 +171,9 @@ async function nihaoMicropay({ amountFen, reference, openId, clientIp, descripti
     method: "POST",
     headers: {
       Authorization: `Bearer ${NIHAOPAY_TOKEN}`,
-      "Content-Type": "application/x-www-form-urlencoded"
+      "Content-Type": "application/x-www-form-urlencoded",
     },
-    body: form.toString()
+    body: form.toString(),
   });
 
   const text = await res.text();
@@ -284,27 +181,94 @@ async function nihaoMicropay({ amountFen, reference, openId, clientIp, descripti
   try {
     json = JSON.parse(text);
   } catch (e) {
-    throw new Error(`NihaoPay non-JSON. HTTP ${res.status}. Body: ${text}`);
+    const err = new Error(`NihaoPay non-JSON. HTTP ${res.status}. Body: ${text}`);
+    err.httpStatus = res.status;
+    throw err;
   }
 
-  console.log("[nihao] response http:", res.status);
-  console.log("[nihao] response body:", json);
-
   if (!res.ok) {
-    throw new Error(`NihaoPay HTTP ${res.status}: ${text}`);
+    const err = new Error(`NihaoPay HTTP ${res.status}: ${text}`);
+    err.httpStatus = res.status;
+    err.nihao = json;
+    throw err;
   }
 
   return json;
 }
 
+// ------------------- Orders mapping helpers -------------------
+function normalizePhone(phone) {
+  return String(phone || "").replace(/[^\d+]/g, "");
+}
+
+function toMiniStatus(fin, ful) {
+  fin = (fin || "").toUpperCase();
+  ful = (ful || "").toUpperCase();
+
+  if (fin.includes("PENDING") || fin.includes("UNPAID")) return "pending";
+  if (fin.includes("PAID") && (ful.includes("UNFULFILLED") || ful.includes("PARTIAL"))) return "paid";
+  if (ful.includes("FULFILLED")) return "shipped";
+  return "paid";
+}
+
+function badgeForStatus(status) {
+  if (status === "pending") return { badgeText: "待付款", badgeClass: "badge--pending" };
+  if (status === "paid") return { badgeText: "已付款", badgeClass: "badge--paid" };
+  if (status === "shipped") return { badgeText: "已发货", badgeClass: "badge--shipped" };
+  return { badgeText: "已完成", badgeClass: "badge--completed" };
+}
+
+// ------------------- WeChat Subscribe Message (Shipping) -------------------
+async function sendShipSubscribeMessage({ openid, orderName, carrier, trackingNo }) {
+  assertEnv("WX_APPID", WX_APPID);
+  assertEnv("WX_SECRET", WX_SECRET);
+  assertEnv("WX_SHIP_TEMPLATE_ID", WX_SHIP_TEMPLATE_ID);
+
+  const tokenRes = await fetch(
+    `https://api.weixin.qq.com/cgi-bin/token?grant_type=client_credential&appid=${WX_APPID}&secret=${WX_SECRET}`
+  );
+  const tokenJson = await tokenRes.json();
+  if (!tokenJson.access_token) throw new Error("Failed to get access_token: " + JSON.stringify(tokenJson));
+
+  // IMPORTANT: these keys MUST match your template:
+  // thing1, character_string2, time3, character_string4
+  const body = {
+    touser: openid,
+    template_id: WX_SHIP_TEMPLATE_ID,
+    page: "pages/orders/orders",
+    data: {
+      thing1: { value: carrier || "物流已发出" },
+      character_string2: { value: trackingNo || "暂无" },
+      time3: { value: new Date().toISOString().slice(0, 19).replace("T", " ") },
+      character_string4: { value: orderName || "订单已发货" },
+    },
+  };
+
+  const res = await fetch(
+    `https://api.weixin.qq.com/cgi-bin/message/subscribe/send?access_token=${tokenJson.access_token}`,
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    }
+  );
+
+  const json = await res.json();
+  if (json.errcode !== 0) {
+    console.error("WeChat subscribe send failed:", json);
+  } else {
+    console.log("[wechat] shipping subscribe message sent ok:", orderName);
+  }
+}
+
 // ------------------- ROUTES -------------------
 
-// Health
+// Health check
 app.get("/", (_req, res) => {
   res.status(200).json({ ok: true, service: "wechat-shopify-server" });
 });
 
-// Stock lookup
+// Stock lookup (optional)
 app.get("/api/stock", async (req, res) => {
   try {
     const productId = req.query.productId;
@@ -327,7 +291,7 @@ app.get("/api/stock", async (req, res) => {
   }
 });
 
-// PREPAY
+// PREPAY: Mini Program -> server -> WeChat openid -> NihaoPay micropay -> return wx.requestPayment params
 app.post("/api/pay/prepay", async (req, res) => {
   try {
     const { wxCode, amountCNY, items, address, remark } = req.body || {};
@@ -337,7 +301,6 @@ app.post("/api/pay/prepay", async (req, res) => {
     if (!amountFen) return res.status(400).json({ error: "Invalid amountCNY" });
 
     const openid = await wechatCodeToOpenId(wxCode);
-
     const clientIp = getClientIp(req);
     const paymentId = genReference();
 
@@ -349,8 +312,9 @@ app.post("/api/pay/prepay", async (req, res) => {
       remark: remark || "",
       nihaoTxId: null,
       orderId: null,
-      openid,
-      createdAt: Date.now()
+      orderName: null,
+      wechatOpenId: openid, // <-- needed for shipping notifications later
+      createdAt: Date.now(),
     });
 
     const np = await nihaoMicropay({
@@ -359,28 +323,29 @@ app.post("/api/pay/prepay", async (req, res) => {
       openId: openid,
       clientIp,
       description: "Erethereal WeChat Mini Program",
-      note: remark || "WeChat Mini Program"
+      note: remark || "WeChat Mini Program",
     });
 
+    // NihaoPay returns fields used by wx.requestPayment
     return res.json({
       paymentId,
       timeStamp: np.timeStamp,
       nonceStr: np.nonceStr,
       package: np.wechatPackage,
       signType: np.signType,
-      paySign: np.paySign
+      paySign: np.paySign,
     });
   } catch (err) {
     console.error("POST /api/pay/prepay error", err);
     return res.status(500).json({
       error: "Internal error",
       message: err?.message || String(err),
-      detail: err?.nihao || err?.wechat
+      detail: err?.nihao || err?.wechat,
     });
   }
 });
 
-// IPN
+// IPN: NihaoPay notifies us of transaction status
 app.post("/api/nihao/ipn", async (req, res) => {
   try {
     const tx = req.body || {};
@@ -412,7 +377,7 @@ app.post("/api/nihao/ipn", async (req, res) => {
   }
 });
 
-// Create Shopify order ONLY after payment confirmed "paid"
+// Create Shopify order ONLY after payment confirmed "paid" (via IPN)
 app.post("/api/order/create-paid", async (req, res) => {
   try {
     const { paymentId, items, address, remark } = req.body || {};
@@ -429,6 +394,7 @@ app.post("/api/order/create-paid", async (req, res) => {
       return res.status(409).json({ error: "PAYMENT_NOT_CONFIRMED", status: p.status });
     }
 
+    // Build shipping address from WeChat chooseAddress payload
     const ship = address || p.address || {};
     const fullName = ship.userName || "WeChat Customer";
 
@@ -441,12 +407,12 @@ app.post("/api/order/create-paid", async (req, res) => {
       country: "China",
       firstName: fullName,
       lastName: "",
-      phone: ship.telNumber || ""
+      phone: ship.telNumber || "",
     };
 
     const lineItems = (items || p.items || []).map((it) => ({
       variantId: it.variantId,
-      quantity: Number(it.quantity) || 1
+      quantity: Number(it.quantity) || 1,
     }));
 
     if (!lineItems.length) return res.status(400).json({ error: "No line items" });
@@ -465,7 +431,9 @@ app.post("/api/order/create-paid", async (req, res) => {
       shippingAddress,
       lineItems,
       tags: ["WeChat Mini Program", "NihaoPay", `payment:${paymentId}`],
-      note: `Paid via NihaoPay. paymentId=${paymentId}\nwx_openid=${p.openid || ""}\n备注: ${remark || p.remark || ""}\nTel: ${ship.telNumber || ""}`
+      note: `Paid via NihaoPay. paymentId=${paymentId}\n备注: ${remark || p.remark || ""}\nTel: ${
+        ship.telNumber || ""
+      }`,
     };
 
     const orderData = await shopifyAdminGraphQL(orderMutation, { order: orderInput });
@@ -476,30 +444,8 @@ app.post("/api/order/create-paid", async (req, res) => {
     }
 
     p.orderId = result.order.id;
+    p.orderName = result.order.name;
     payments.set(paymentId, p);
-
-    // ✅ Store openid on the order as a metafield (persistent)
-    if (p.openid) {
-      const setMeta = `
-        mutation setMeta($metafields: [MetafieldsSetInput!]!) {
-          metafieldsSet(metafields: $metafields) {
-            metafields { id key namespace }
-            userErrors { field message }
-          }
-        }
-      `;
-      await shopifyAdminGraphQL(setMeta, {
-        metafields: [
-          {
-            ownerId: result.order.id,
-            namespace: "wechat",
-            key: "openid",
-            type: "single_line_text_field",
-            value: String(p.openid)
-          }
-        ]
-      });
-    }
 
     return res.json({ success: true, order: result.order });
   } catch (err) {
@@ -561,7 +507,9 @@ app.get("/api/orders", async (req, res) => {
     const phone = normalizePhone(req.query.phone);
     if (!phone) return res.status(400).json({ error: "Missing phone" });
 
-    const data = await shopifyAdminGraphQL(ORDER_LIST_QUERY, { query: `phone:${phone}` });
+    const data = await shopifyAdminGraphQL(ORDER_LIST_QUERY, {
+      query: `phone:${phone}`,
+    });
 
     const out = (data.orders.nodes || []).map((o) => {
       const status = toMiniStatus(o.displayFinancialStatus, o.displayFulfillmentStatus);
@@ -572,14 +520,14 @@ app.get("/api/orders", async (req, res) => {
         total: o.currentTotalPriceSet.shopMoney.amount,
         status,
         ...badgeForStatus(status),
-        itemsSummary: o.lineItems.nodes.map((li) => `${li.title} ×${li.quantity}`).join("，")
+        itemsSummary: (o.lineItems.nodes || []).map((li) => `${li.title} ×${li.quantity}`).join("，"),
       };
     });
 
     res.json(out);
   } catch (e) {
     console.error(e);
-    res.status(500).json({ error: e.message });
+    res.status(500).json({ error: e?.message || String(e) });
   }
 });
 
@@ -591,9 +539,8 @@ app.get("/api/orders/:id", async (req, res) => {
     if (!o) return res.status(404).json({ error: "Order not found" });
 
     const status = toMiniStatus(o.displayFinancialStatus, o.displayFulfillmentStatus);
-
     const addr = o.shippingAddress || {};
-    const tracking = o.fulfillments?.[0]?.trackingInfo?.[0];
+    const tracking = o.fulfillments?.[0]?.trackingInfo?.[0] || null;
 
     res.json({
       id: o.id,
@@ -601,10 +548,10 @@ app.get("/api/orders/:id", async (req, res) => {
       date: o.createdAt.replace("T", " ").slice(0, 16),
       status,
       ...badgeForStatus(status),
-      items: o.lineItems.nodes.map((li) => ({
+      items: (o.lineItems.nodes || []).map((li) => ({
         title: li.title,
         qty: li.quantity,
-        price: li.originalTotalSet.shopMoney.amount
+        price: li.originalTotalSet.shopMoney.amount,
       })),
       subtotal: o.currentSubtotalPriceSet.shopMoney.amount,
       shipping: o.totalShippingPriceSet.shopMoney.amount,
@@ -612,85 +559,105 @@ app.get("/api/orders/:id", async (req, res) => {
       address: {
         name: addr.name || "",
         phone: addr.phone || "",
-        full: [addr.country, addr.province, addr.city, addr.address1, addr.address2, addr.zip].filter(Boolean).join(" ")
+        full: [addr.country, addr.province, addr.city, addr.address1, addr.address2, addr.zip]
+          .filter(Boolean)
+          .join(" "),
       },
-      tracking: tracking ? { company: tracking.company, number: tracking.number, url: tracking.url } : null
+      tracking: tracking ? { company: tracking.company, number: tracking.number, url: tracking.url } : null,
     });
   } catch (e) {
     console.error(e);
-    res.status(500).json({ error: e.message });
+    res.status(500).json({ error: e?.message || String(e) });
   }
 });
 
-// ------------------- SHOPIFY WEBHOOK: fulfillment create/update -------------------
-// Create Shopify webhooks for:
-// - fulfillments/create
-// - fulfillments/update
-// Point them to:  POST  https://wechat-shopify-server.onrender.com/api/webhooks/fulfillment
+// ------------------- SHOPIFY WEBHOOK: orders/fulfilled → WeChat subscribe message -------------------
 
-const ORDER_FOR_NOTIFY_QUERY = `
-query OrderNotify($id: ID!) {
-  order(id: $id) {
-    id
-    name
-    fulfillments(first: 5) {
-      trackingInfo { company number url }
+// raw body parser ONLY for this route
+app.post(
+  "/api/shopify/webhook",
+  express.raw({ type: "*/*" }),
+  async (req, res) => {
+    try {
+      assertEnv("SHOPIFY_WEBHOOK_SECRET", SHOPIFY_WEBHOOK_SECRET);
+
+      const hmacHeader = req.get("X-Shopify-Hmac-Sha256") || "";
+      const topic = req.get("X-Shopify-Topic") || "";
+
+      // Verify signature
+      const digest = crypto
+        .createHmac("sha256", SHOPIFY_WEBHOOK_SECRET)
+        .update(req.body, "utf8")
+        .digest("base64");
+
+      if (digest !== hmacHeader) {
+        console.error("[shopify webhook] HMAC verification failed");
+        return res.status(401).send("Unauthorized");
+      }
+
+      // We only care about fulfillments
+      if (topic !== "orders/fulfilled") {
+        return res.status(200).send("Ignored");
+      }
+
+      const payloadStr = Buffer.isBuffer(req.body) ? req.body.toString("utf8") : String(req.body || "");
+      const payload = JSON.parse(payloadStr);
+
+      // payload has: id (numeric), name (#1001), note, tags, fulfillments, etc.
+      const orderName = payload.name || "";
+      const tags = String(payload.tags || "");
+      const note = String(payload.note || "");
+
+      // pull paymentId from either tags "payment:xxxx" or note "paymentId=xxxx"
+      let paymentId =
+        (tags.match(/payment:([a-zA-Z0-9]+)/) || [])[1] ||
+        (note.match(/paymentId=([a-zA-Z0-9]+)/) || [])[1] ||
+        "";
+
+      // Tracking from webhook payload (sometimes fulfillments array contains tracking info)
+      let carrier = "PostNL";
+      let trackingNo = "";
+      if (payload.fulfillments && payload.fulfillments.length) {
+        const f = payload.fulfillments[0];
+        if (f.tracking_company) carrier = f.tracking_company;
+        if (f.tracking_number) trackingNo = f.tracking_number;
+        if (f.tracking_numbers && f.tracking_numbers.length) trackingNo = f.tracking_numbers[0];
+      }
+
+      if (!paymentId || !payments.has(paymentId)) {
+        console.warn("[shopify webhook] paymentId not found in memory:", paymentId, "order:", orderName);
+        // In-memory store limitation: if Render restarts, we lose it.
+        // Still return 200 so Shopify won't retry forever.
+        return res.status(200).send("OK (no payment match)");
+      }
+
+      const p = payments.get(paymentId);
+      const openid = p?.wechatOpenId;
+
+      if (!openid) {
+        console.warn("[shopify webhook] missing wechatOpenId for paymentId:", paymentId);
+        return res.status(200).send("OK (no openid)");
+      }
+
+      // Send WeChat subscription message
+      await sendShipSubscribeMessage({
+        openid,
+        orderName: orderName || p.orderName || `订单${paymentId}`,
+        carrier: carrier || "PostNL",
+        trackingNo: trackingNo || "暂无",
+      });
+
+      return res.status(200).send("OK");
+    } catch (e) {
+      console.error("[shopify webhook] error:", e);
+      // Still 200 to avoid Shopify repeated retries while you're testing
+      return res.status(200).send("OK (error logged)");
     }
-    metafield(namespace:"wechat", key:"openid") { value }
   }
-}
-`;
-
-app.post("/api/webhooks/fulfillment", async (req, res) => {
-  try {
-    // Verify webhook
-    if (!verifyShopifyHmac(req)) {
-      console.log("[webhook] invalid hmac");
-      return res.status(401).send("invalid hmac");
-    }
-
-    // Shopify fulfillments webhook payload has numeric order_id
-    const orderIdNum = req.body && req.body.order_id;
-    if (!orderIdNum) {
-      return res.status(200).json({ ok: true, skipped: true, reason: "NO_ORDER_ID" });
-    }
-
-    const orderGid = `gid://shopify/Order/${orderIdNum}`;
-
-    const data = await shopifyAdminGraphQL(ORDER_FOR_NOTIFY_QUERY, { id: orderGid });
-    const order = data.order;
-    if (!order) return res.status(200).json({ ok: true, skipped: true, reason: "ORDER_NOT_FOUND" });
-
-    const openid = order.metafield?.value || "";
-    const tracking = order.fulfillments?.[0]?.trackingInfo?.[0] || null;
-
-    // If there is no tracking yet, still send “shipped” with placeholders
-    const company = tracking?.company || "PostNL";
-    const number = tracking?.number || "";
-    const shipTime = new Date().toISOString().replace("T", " ").slice(0, 16);
-
-    // Attempt send
-    const result = await sendWeChatShipMessage({
-      openid,
-      orderGid,
-      orderName: order.name,
-      logisticsCompany: company,
-      trackingNumber: number,
-      shipTime
-    });
-
-    return res.status(200).json({ ok: true, sent: true, result });
-  } catch (e) {
-    console.error("[webhook] error:", e.message || e);
-
-    // Always 200 so Shopify doesn't retry forever while we're iterating keys.
-    // We'll use logs to fix any template key mismatch.
-    return res.status(200).json({ ok: true, sent: false, error: String(e.message || e) });
-  }
-});
+);
 
 // ------------------- START SERVER -------------------
 const PORT = process.env.PORT || 10000;
 app.listen(PORT, () => {
-  console.log("Server running on", PORT);
+  console.log("Wechat-Shopify server running on port", PORT);
 });
